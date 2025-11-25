@@ -1,5 +1,105 @@
-#this is where all the code will go
-#Part 1
-#part 2
-#part 3
-#part 4
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+import numpy as np
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+
+STATIONS_CSV = "data/mbta_stations.csv"
+RIDERSHIP_CSV = "data/mbta_station_ridership.csv"
+TRACTS_GEOJSON = "data/acs_tracts.geojson"
+
+STATION_ID_COL = "station_id"
+STATION_LAT_COL = "latitude"
+STATION_LON_COL = "longitude"
+RIDERSHIP_ENTRIES_COL = "entries"
+TRACT_INCOME_COL = "median_income"
+
+MILES = 0.3
+METERS_PER_MILE = 1609.344
+BUFFER_METERS = MILES * METERS_PER_MILE
+
+def load_stations_as_gdf(stations_csv, lat_col, lon_col, station_id_col):
+    df = pd.read_csv(stations_csv)
+    df = df.dropna(subset=[lat_col, lon_col])
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326")
+    if station_id_col not in gdf.columns:
+        raise ValueError
+    return gdf
+
+def load_tracts(path):
+    gdf = gpd.read_file(path)
+    if TRACT_INCOME_COL not in gdf.columns:
+        raise ValueError
+    gdf = gdf[~gdf[TRACT_INCOME_COL].isna()].copy()
+    return gdf
+
+def aggregate_ridership(path, id_col, entries_col):
+    df = pd.read_csv(path)
+    agg = df.groupby(id_col)[entries_col].agg(['mean','sum','count']).reset_index()
+    agg = agg.rename(columns={'mean':'entries_mean','sum':'entries_total','count':'n_observations'})
+    return agg
+
+def compute_avg_income_per_station(stations, tracts, radius_meters=BUFFER_METERS, income_col=TRACT_INCOME_COL):
+    stations = stations.to_crs(epsg=4326)
+    tracts = tracts.to_crs(epsg=4326)
+    s_m = stations.to_crs(epsg=3857)
+    t_m = tracts.to_crs(epsg=3857)
+
+    sindex = t_m.sindex
+    incomes = []
+
+    for _, st in s_m.iterrows():
+        buf = st.geometry.buffer(radius_meters)
+        candidates_idx = list(sindex.intersection(buf.bounds))
+        if len(candidates_idx) == 0:
+            candidates = t_m
+        else:
+            candidates = t_m.iloc[candidates_idx]
+        inter = candidates[candidates.geometry.intersects(buf)]
+
+        if len(inter) > 0:
+            vals = inter[income_col].dropna().values
+            if len(vals) == 0:
+                incomes.append(np.nan)
+            else:
+                incomes.append(float(np.mean(vals)))
+        else:
+            if candidates.empty:
+                candidates = t_m
+            dists = candidates.geometry.centroid.distance(st.geometry)
+            nearest = dists.idxmin()
+            incomes.append(float(candidates.loc[nearest, income_col]))
+
+    out = s_m.copy()
+    out['avg_income_nearby'] = incomes
+    return out.to_crs(epsg=4326)
+
+def main():
+    stations = load_stations_as_gdf(STATIONS_CSV, STATION_LAT_COL, STATION_LON_COL, STATION_ID_COL)
+    tracts = load_tracts(TRACTS_GEOJSON)
+    ridership = aggregate_ridership(RIDERSHIP_CSV, STATION_ID_COL, RIDERSHIP_ENTRIES_COL)
+
+    stations_income = compute_avg_income_per_station(stations, tracts, BUFFER_METERS)
+    merged = stations_income.merge(ridership, on=STATION_ID_COL, how='left')
+
+    reg_df = merged.dropna(subset=['avg_income_nearby','entries_mean'])
+    if len(reg_df) >= 3:
+        X = reg_df[['avg_income_nearby']].values
+        y = reg_df['entries_mean'].values
+        model = LinearRegression().fit(X,y)
+        xs = np.linspace(reg_df['avg_income_nearby'].min(), reg_df['avg_income_nearby'].max(), 100)
+        plt.scatter(reg_df['avg_income_nearby'], reg_df['entries_mean'])
+        plt.plot(xs, model.predict(xs.reshape(-1,1)))
+        plt.xlabel('Average nearby median income')
+        plt.ylabel('Mean entries per station')
+        plt.title('Income vs mean station entries')
+        plt.tight_layout()
+        plt.show()
+
+    merged.to_file("output/stations_with_income_and_ridership.geojson", driver="GeoJSON")
+    return merged
+
+if __name__ == "__main__":
+    merged_df = main()
+
