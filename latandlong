@@ -1,0 +1,17 @@
+import geopandas as gpd
+
+# Load your node shapefile (the station points)
+nodes = gpd.read_file("MBTA_NODE.shp")
+
+# Extract lat/lon
+nodes["longitude"] = nodes.geometry.x
+nodes["latitude"] = nodes.geometry.y
+
+# Create a clean station ID
+nodes["station_id"] = nodes.index.astype(str)
+
+# Keep only usable fields
+stations_csv = nodes[["station_id", "STATION", "LINE", "latitude", "longitude"]]
+
+# Save for your main pipeline
+stations_csv.to_csv("data/mbta_stations.csv", index=False)
