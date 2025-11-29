@@ -1,0 +1,120 @@
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -------------------------------
+# 1. Load aggregated ridership data
+# -------------------------------
+agg = pd.read_csv("gated_entries_by_day.csv")
+
+# Basic info
+print("Data info:")
+print(agg.info())
+
+# -------------------------------
+# 2. Summary statistics
+# -------------------------------
+print("\nSummary statistics for ridership columns:")
+print(agg[['entries_mean','entries_total','n_observations']].describe())
+
+print("\nMissing values per column:")
+print(agg[['entries_mean','entries_total','n_observations']].isna().sum())
+
+# -------------------------------
+# 3. Top and bottom stops
+# -------------------------------
+top10 = agg.nlargest(10, 'entries_total')
+bottom10 = agg.nsmallest(10, 'entries_total')
+print("\nTop 10 busiest stops:")
+print(top10[['stop_id','entries_total','entries_mean']])
+print("\nBottom 10 least busy stops:")
+print(bottom10[['stop_id','entries_total','entries_mean']])
+
+# -------------------------------
+# 4. Distribution of ridership
+# -------------------------------
+plt.figure(figsize=(10,5))
+sns.histplot(agg['entries_mean'], bins=40, kde=True, color='skyblue')
+plt.title('Distribution of Mean Entries per Stop')
+plt.xlabel('Mean Entries per Stop')
+plt.ylabel('Number of Stops')
+plt.show()
+
+plt.figure(figsize=(10,5))
+sns.histplot(agg['entries_total'], bins=40, kde=True, color='salmon')
+plt.title('Distribution of Total Entries per Stop')
+plt.xlabel('Total Entries per Stop')
+plt.ylabel('Number of Stops')
+plt.show()
+
+# -------------------------------
+# 5. Load bus stops shapefile
+# -------------------------------
+bus_stops_gdf = gpd.read_file('MBTABUSSTOPS_PT.shp')
+print("\nBus stops shapefile preview:")
+print(bus_stops_gdf.head())
+
+# Merge ridership into bus stops
+bus_stops_gdf = bus_stops_gdf.merge(agg, left_on='STOP_ID', right_on='stop_id', how='left')
+
+# -------------------------------
+# 6. Map of all stops with top 10 highlighted
+# -------------------------------
+top10_gdf = bus_stops_gdf.nlargest(10, 'entries_total')
+
+plt.figure(figsize=(12,12))
+base = bus_stops_gdf.plot(color='lightgrey', markersize=10, alpha=0.5)
+top10_gdf.plot(ax=base, color='red', markersize=50, label='Top 10 Stops')
+plt.title('Top 10 Busiest MBTA Stops')
+plt.legend()
+plt.show()
+
+# -------------------------------
+# 7. Merge with census tracts for population context
+# -------------------------------
+tracts = gpd.read_file("CENSUS2020TRACTS_POLY.shp")
+tracts = tracts.to_crs(bus_stops_gdf.crs)
+
+# Spatial join
+stops_with_tracts = gpd.sjoin(bus_stops_gdf, tracts[['GEOID20','POP20','HOUSING20','geometry']],
+                              how='left', predicate='within')
+
+print("\nStops with census tract info:")
+print(stops_with_tracts[['STOP_ID','STOP_NAME','entries_total','POP20','HOUSING20']].head())
+
+# -------------------------------
+# 8. Ridership vs population analysis
+# -------------------------------
+plt.figure(figsize=(8,6))
+sns.scatterplot(data=stops_with_tracts, x='POP20', y='entries_total')
+plt.title('Ridership vs Census Tract Population')
+plt.xlabel('Population in Tract')
+plt.ylabel('Total Entries at Stop')
+plt.show()
+
+plt.figure(figsize=(8,6))
+sns.scatterplot(data=stops_with_tracts, x='HOUSING20', y='entries_total')
+plt.title('Ridership vs Census Tract Housing Units')
+plt.xlabel('Housing Units in Tract')
+plt.ylabel('Total Entries at Stop')
+plt.show()
+
+# -------------------------------
+# 9. Heatmap of ridership intensity
+# -------------------------------
+plt.figure(figsize=(12,12))
+tracts.plot(color='lightgrey', edgecolor='white', alpha=0.5)
+bus_stops_gdf.plot(column='entries_total', cmap='Reds', markersize=20, legend=True, alpha=0.7)
+plt.title('Ridership Intensity Across MBTA Stops')
+plt.show()
+
+# -------------------------------
+# 10. Correlation analysis
+# -------------------------------
+corr_df = stops_with_tracts[['entries_total','entries_mean','POP20','HOUSING20']].dropna()
+print("\nCorrelation matrix:")
+print(corr_df.corr())
+sns.heatmap(corr_df.corr(), annot=True, cmap='coolwarm')
+plt.title('Correlation Between Ridership and Census Variables')
+plt.show()
