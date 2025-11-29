@@ -1,0 +1,87 @@
+import pandas as pd
+import geopandas as gpd
+from shapely import wkt
+
+# -------------------------------
+# Load MBTA datasets
+# -------------------------------
+stations = pd.read_csv("mbta_stations.csv")
+ridership = pd.read_csv("MBTA_Monthly_Ridership_By_Mode_and_Line.csv")
+gated_entries = pd.read_csv("MBTA_Gated_Station_entries.csv")
+
+# Merge ridership and gated entries into stations
+merged = stations.merge(ridership, left_on='station_name', right_on='route_or_line', how='left')
+merged = merged.merge(gated_entries, left_on='station_name', right_on='station_name', how='left')
+
+# Convert WKT geometry to shapely Point
+merged['geometry'] = merged['geometry'].apply(wkt.loads)
+
+# Convert to GeoDataFrame
+stations_gdf = gpd.GeoDataFrame(merged, geometry='geometry', crs="EPSG:4326")  # assuming lat/lon
+
+# Extract lat/lon for reference
+stations_gdf['longitude'] = stations_gdf['geometry'].apply(lambda point: point.x)
+stations_gdf['latitude'] = stations_gdf['geometry'].apply(lambda point: point.y)
+
+# -------------------------------
+# Load Census Tracts shapefile
+# -------------------------------
+tracts = gpd.read_file("CENSUS2020TRACTS_POLY.shp")  # adjust path as needed
+tracts = tracts.to_crs("EPSG:4326")  # make sure CRS matches stations_gdf
+
+# -------------------------------
+# Spatial join: assign stations to census tracts
+# -------------------------------
+stations_with_tracts = gpd.sjoin(
+    stations_gdf,
+    tracts[['GEOID20','INTPTLAT20','INTPTLON20','POP20','HOUSING20','geometry']],
+    how='left',
+    predicate='within'  # updated for GeoPandas >=0.10
+)
+
+# Optional: drop geometry if not needed
+# stations_with_tracts = stations_with_tracts.drop(columns=['geometry'])
+
+# Drop rows where all numeric ridership columns are missing
+stations_with_tracts = stations_with_tracts.dropna(subset=['ridership_total', 'ridership_average', 'gated_entries'], how='all')
+import pandas as pd
+
+
+def load_ridership(path):
+    # Load the CSV
+    df = pd.read_csv(path)
+
+    # Drop rows by index safely (inplace)
+    drop_indices = [1222104, 1222105, 1222106]
+    df = df.drop(drop_indices,
+                 errors='ignore')  # ignores if index doesn't exist
+
+    # Aggregate gated entries per stop per day
+    daily_agg = df.groupby(['stop_id', 'service_date'], as_index=False)[
+        'gated_entries'].sum()
+
+    # Aggregate statistics per stop across all days
+    stop_agg = daily_agg.groupby('stop_id')['gated_entries'].agg(
+        entries_mean='mean',
+        entries_total='sum',
+        n_observations='count'
+    ).reset_index()
+
+    return stop_agg
+
+
+# Load and process
+agg = load_ridership('MBTA_Gated_Station_Entries.csv')
+
+# Save to CSV
+agg.to_csv("gated_entries_by_day.csv", index=False)
+
+# Quick EDA example
+print("Top 10 stops by total entries:")
+print(agg.sort_values('entries_total', ascending=False).head(10))
+
+# -------------------------------
+# Check merged dataframe
+# -------------------------------
+print(stations_with_tracts.head())
+print("Total rows after merging with tracts:", stations_with_tracts.shape[0])
