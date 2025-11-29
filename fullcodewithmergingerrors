@@ -1,0 +1,214 @@
+# -------------------------------
+# MBTA Bus Stops & Ridership EDA
+# -------------------------------
+
+import pandas as pd
+import geopandas as gpd
+from shapely import wkt
+import matplotlib.pyplot as plt
+
+# -------------------------------
+# 1. Load bus stops shapefile
+# -------------------------------
+bus_stops = gpd.read_file("MBTABUSSTOPS_PT.shp")  # adjust path
+bus_stops = bus_stops.to_crs("EPSG:4326")         # ensure CRS matches lat/lon
+
+# Keep only valid geometries
+bus_stops = bus_stops[bus_stops.is_valid]
+
+# Add longitude/latitude
+bus_stops.loc[:, 'longitude'] = bus_stops['geometry'].apply(lambda p: p.x)
+bus_stops.loc[:, 'latitude'] = bus_stops['geometry'].apply(lambda p: p.y)
+
+# Ensure STOP_ID is string for merging
+bus_stops.loc[:, 'STOP_ID'] = bus_stops['STOP_ID'].astype(str)
+
+print("Sample bus stops STOP_IDs:", bus_stops['STOP_ID'].head().tolist())
+print("Sample bus stop names:", bus_stops['STOP_NAME'].head().tolist())
+
+# -------------------------------
+# 2. Load gated entries and aggregate
+# -------------------------------
+def load_ridership(path):
+    df = pd.read_csv(path)
+    df.drop([1222104, 1222105, 1222106], errors='ignore', inplace=True)
+    # Sum per stop per day
+    daily_agg = df.groupby(['stop_id', 'service_date'])['gated_entries'].sum().reset_index()
+    # Aggregate across all days per stop
+    agg = daily_agg.groupby('stop_id')['gated_entries'].agg(['mean','sum','count']).reset_index()
+    agg = agg.rename(columns={'mean':'entries_mean','sum':'entries_total','count':'n_observations'})
+    agg['stop_id'] = agg['stop_id'].astype(str)  # ensure string for merge
+    return agg
+
+agg = load_ridership('MBTA_Gated_Station_Entries.csv')
+print("\nSample aggregated ridership:")
+print(agg.head())
+
+# -------------------------------
+# 3. Merge stops with ridership
+# -------------------------------
+stops_with_ridership = bus_stops.merge(
+    agg, left_on='STOP_ID', right_on='stop_id', how='left'
+)
+
+print("\nMerged bus stops with ridership:")
+print(stops_with_ridership.head())
+
+# -------------------------------
+# 4. Load Census tracts
+# -------------------------------
+tracts = gpd.read_file("CENSUS2020TRACTS_POLY.shp")  # adjust path
+tracts = tracts.to_crs("EPSG:4326")
+tracts = tracts[tracts.is_valid]
+
+# -------------------------------
+# 5. Spatial join: assign stops to census tracts
+# -------------------------------
+stops_with_tracts = gpd.sjoin(
+    stops_with_ridership,
+    tracts[['GEOID20','INTPTLAT20','INTPTLON20','POP20','HOUSING20','geometry']],
+    how='left',
+    predicate='within'
+)
+
+# Drop NaN geometries
+stops_with_tracts = stops_with_tracts[stops_with_tracts['geometry'].notna()]
+
+print("\nTotal stops after merging with tracts:", stops_with_tracts.shape[0])
+
+# -------------------------------
+# 6. Basic stats
+# -------------------------------
+ridership_cols = ['entries_mean', 'entries_total', 'n_observations']
+print("\nBasic stats for ridership columns:")
+print(stops_with_tracts[ridership_cols].describe())
+
+print("\nMissing values per column:")
+print(stops_with_tracts[ridership_cols].isna().sum())
+
+# -------------------------------
+# 7. Top / bottom stops by ridership
+# -------------------------------
+print("\nTop 10 busiest stops by total entries:")
+print(stops_with_tracts.nlargest(10, 'entries_total')[['STOP_NAME','entries_total','entries_mean']])
+
+print("\nBottom 10 stops by total entries:")
+print(stops_with_tracts.nsmallest(10, 'entries_total')[['STOP_NAME','entries_total','entries_mean']])
+
+# -------------------------------
+# 8. Correlation matrix
+# -------------------------------
+corr_cols = ['entries_mean', 'entries_total', 'n_observations', 'POP20', 'HOUSING20']
+print("\nCorrelation matrix:")
+print(stops_with_tracts[corr_cols].corr())
+
+# -------------------------------
+# 9. Visualize top 20 busiest stops
+# -------------------------------
+top20 = stops_with_tracts.nlargest(20, 'entries_total')
+top20 = top20[top20['geometry'].notna()]
+
+ax = top20.plot(markersize=50, color='red', legend=True, figsize=(10,8))
+ax.set_title("Top 20 MBTA Bus Stops by Total Gated Entries")
+plt.show()
+
+# -------------------------------
+# 10. Optional: Histogram of ridership
+# -------------------------------
+stops_with_tracts['entries_total'].hist(bins=50, figsize=(10,6))
+plt.title("Distribution of Total Gated Entries Across Stops")
+plt.xlabel("Total Entries")
+plt.ylabel("Number of Stops")
+plt.show()
+# -------------------------------
+# 11. Regression Analysis
+# -------------------------------
+
+import statsmodels.api as sm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Keep only rows with complete data for regression
+reg_df = stops_with_tracts[['entries_total', 'POP20', 'HOUSING20']].dropna()
+
+# Features (X) and target (y)
+X = reg_df[['POP20', 'HOUSING20']]
+y = reg_df['entries_total']
+
+# Add constant for intercept (for statsmodels)
+X_sm = sm.add_constant(X)
+
+# 11a. Fit linear regression using statsmodels
+model = sm.OLS(y, X_sm).fit()
+print("\nLinear Regression Summary (statsmodels):")
+print(model.summary())
+
+# 11b. Fit using scikit-learn to get predictions and metrics
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+from sklearn.linear_model import LinearRegression
+lr = LinearRegression()
+lr.fit(X_train, y_train)
+y_pred = lr.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+
+print(f"\nLinear Regression (sklearn) Metrics:\nMSE: {mse:.2f}\nR²: {r2:.3f}")
+
+# -------------------------------
+# 12. Optional: Scatter plots
+# -------------------------------
+plt.figure(figsize=(10,5))
+plt.scatter(reg_df['POP20'], reg_df['entries_total'], alpha=0.6, label='Population')
+plt.scatter(reg_df['HOUSING20'], reg_df['entries_total'], alpha=0.6, label='Housing Units', color='orange')
+plt.xlabel("Population / Housing Units")
+plt.ylabel("Total Entries")
+plt.title("Ridership vs Census Tract Characteristics")
+plt.legend()
+plt.show()
+# -------------------------------
+# 13. Machine Learning Methods
+# -------------------------------
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+
+# Prepare dataset: keep only rows with complete data
+ml_df = stops_with_tracts[['entries_total', 'POP20', 'HOUSING20']].dropna()
+X = ml_df[['POP20', 'HOUSING20']]
+y = ml_df['entries_total']
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 13a. Random Forest Regression
+rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
+rf.fit(X_train, y_train)
+y_pred_rf = rf.predict(X_test)
+
+# Metrics
+mse_rf = mean_squared_error(y_test, y_pred_rf)
+r2_rf = r2_score(y_test, y_pred_rf)
+
+print("\nRandom Forest Regression Metrics:")
+print(f"MSE: {mse_rf:.2f}")
+print(f"R²: {r2_rf:.3f}")
+
+# Feature importance
+feat_imp = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+print("\nRandom Forest Feature Importances:")
+print(feat_imp)
+
+# 13b. Optional: Standardized Linear Regression (if desired)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+X_train_s, X_test_s, y_train_s, y_test_s = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+lr_scaled = LinearRegression()
+lr_scaled.fit(X_train_s, y_train_s)
+y_pred_scaled = lr_scaled.predict(X_test_s)
+
+mse_lr_s = mean_squared_error(y_test_s, y_pred_scaled)
+r2_lr_s = r2_score(y_test_s, y_pred_scaled)
+print(f"\nLinear Regression (Standardized) Metrics:\nMSE: {mse_lr_s:.2f}, R²: {r2_lr_s:.3f}")
