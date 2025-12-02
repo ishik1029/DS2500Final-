@@ -1,0 +1,217 @@
+import pandas as pd
+import geopandas as gpd
+from shapely import wkt
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
+
+# -------------------------------
+# 1) Load MBTA stops
+# -------------------------------
+stops = pd.read_csv("stops.txt")
+
+# Convert to GeoDataFrame
+stops['geometry'] = stops.apply(lambda row: wkt.loads(f"POINT({row['stop_lon']} {row['stop_lat']})"), axis=1)
+stops_gdf = gpd.GeoDataFrame(stops, geometry='geometry', crs="EPSG:4326")
+
+# -------------------------------
+# 2) Load MBTA ridership and aggregate
+# -------------------------------
+gated_entries = pd.read_csv("MBTA_Gated_Station_Entries.csv")
+
+def load_ridership(df):
+    drop_indices = [1222104, 1222105, 1222106]
+    df = df.drop(drop_indices, errors='ignore')
+    daily_agg = df.groupby(['stop_id', 'service_date'], as_index=False)['gated_entries'].sum()
+    stop_agg = daily_agg.groupby('stop_id')['gated_entries'].agg(
+        entries_mean='mean',
+        entries_total='sum',
+        n_observations='count'
+    ).reset_index()
+    return stop_agg
+
+agg = load_ridership(gated_entries)
+
+# Merge stops with ridership
+stops_gdf['stop_id'] = stops_gdf['stop_id'].astype(str)
+agg['stop_id'] = agg['stop_id'].astype(str)
+stops_gdf = stops_gdf.merge(agg, on='stop_id', how='left')
+
+# -------------------------------
+# 3) Load Census tracts
+# -------------------------------
+tracts = gpd.read_file("CENSUS2020TRACTS_POLY.shp")
+tracts = tracts.to_crs("EPSG:4326")
+
+# Load median income CSV
+income = pd.read_csv("ACSDT5Y2023.B19013-Data.csv")
+
+# Clean income GEOID and column
+income['GEOID20'] = income['GEO_ID'].str.replace('1400000US','')  # match tract GEOID
+income['MEDIAN_INCOME'] = pd.to_numeric(income['B19013_001E'], errors='coerce')
+
+# Merge tracts with median income
+tracts = tracts.merge(income[['GEOID20','MEDIAN_INCOME']], left_on='GEOID20', right_on='GEOID20', how='left')
+
+# -------------------------------
+# 4) Spatial join: attach tract demographics to stops
+# -------------------------------
+stops_gdf = gpd.sjoin(stops_gdf, tracts[['GEOID20','POP20','HOUSING20','MEDIAN_INCOME','geometry']], how='left', predicate='within')
+
+# -------------------------------
+# 5) Impute missing values for regression
+# -------------------------------
+stops_gdf['POP20'].fillna(stops_gdf['POP20'].median(), inplace=True)
+stops_gdf['HOUSING20'].fillna(stops_gdf['HOUSING20'].median(), inplace=True)
+stops_gdf['MEDIAN_INCOME'].fillna(stops_gdf['MEDIAN_INCOME'].median(), inplace=True)
+
+# Keep only stops with ridership
+model_df = stops_gdf[stops_gdf['entries_mean'].notna()].copy()
+print("Rows available for regression:", len(model_df))
+
+# -------------------------------
+# 6) Regression: predict entries_mean
+# -------------------------------
+X = model_df[['POP20','HOUSING20','MEDIAN_INCOME']]
+y = model_df['entries_mean']
+
+# Optional log-transform if skewed
+y = np.log1p(y)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
+
+reg = LinearRegression()
+reg.fit(X_train, y_train)
+y_pred = reg.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+print(f"Regression results: MSE={mse:.2f}, R2={r2:.2f}")
+
+# -------------------------------
+# 7) Regression visualization
+# -------------------------------
+plt.figure(figsize=(8,6))
+plt.scatter(y_test, y_pred, alpha=0.7)
+plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+plt.xlabel('Actual log(entries_mean)')
+plt.ylabel('Predicted log(entries_mean)')
+plt.title('Linear Regression Fit')
+plt.show()
+
+# Feature importance
+coef_df = pd.DataFrame({'feature': X.columns, 'coefficient': reg.coef_})
+sns.barplot(data=coef_df, x='coefficient', y='feature', palette='viridis')
+plt.title('Feature Coefficients')
+plt.show()
+
+# -------------------------------
+# 8) Top/bottom stops visualization
+# -------------------------------
+top10 = model_df.nlargest(10, 'entries_mean')
+bottom10 = model_df.nsmallest(10, 'entries_mean')
+
+plt.figure(figsize=(10,6))
+sns.barplot(data=top10, x='entries_mean', y='stop_name', palette='viridis')
+plt.title('Top 10 Stops by Average Entries')
+plt.show()
+
+plt.figure(figsize=(10,6))
+sns.barplot(data=bottom10, x='entries_mean', y='stop_name', palette='magma')
+plt.title('Bottom 10 Stops by Average Entries')
+plt.show()
+
+# -------------------------------
+# 9) Map visualization: ridership vs income
+# -------------------------------
+plt.figure(figsize=(12,12))
+# Marker size proportional to entries_mean
+sizes = model_df['entries_mean'] / model_df['entries_mean'].max() * 200
+# Color proportional to MEDIAN_INCOME
+colors = model_df['MEDIAN_INCOME']
+
+model_df.plot(
+    markersize=sizes,
+    column=colors,
+    cmap='viridis',
+    legend=True,
+    alpha=0.7,
+    edgecolor='k'
+)
+plt.title('MBTA Stops: Size = Avg Daily Entries, Color = Median Income')
+plt.show()
+
+plt.figure(figsize=(10,6))
+sns.scatterplot(
+    data=model_df,
+    x='MEDIAN_INCOME',
+    y='entries_mean',
+    size='entries_mean',
+    hue='entries_mean',
+    palette='viridis',
+    alpha=0.7,
+    sizes=(20, 200)
+)
+plt.xlabel("Median Income ($)")
+plt.ylabel("Average Daily Entries")
+plt.title("Ridership vs. Median Income")
+plt.legend(title="Entries", bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.show()
+
+plt.figure(figsize=(10,6))
+sns.scatterplot(
+    x=np.log1p(model_df['MEDIAN_INCOME']),
+    y=np.log1p(model_df['entries_mean']),
+    alpha=0.7
+)
+plt.xlabel("Log(Median Income)")
+plt.ylabel("Log(Average Daily Entries)")
+plt.title("Log-Transformed Ridership vs. Income")
+plt.show()
+
+model_df['income_quartile'] = pd.qcut(model_df['MEDIAN_INCOME'], 4, labels=['Q1','Q2','Q3','Q4'])
+
+plt.figure(figsize=(10,6))
+sns.boxplot(
+    data=model_df,
+    x='income_quartile',
+    y='entries_mean',
+    palette='viridis'
+)
+plt.xlabel("Income Quartile")
+plt.ylabel("Average Daily Entries")
+plt.title("Ridership Distribution by Neighborhood Income Quartile")
+plt.show()
+
+tracts.plot(
+    column='MEDIAN_INCOME',
+    cmap='viridis',
+    legend=True,
+    figsize=(12,12),
+    edgecolor='grey'
+)
+plt.title("Median Household Income by Census Tract")
+plt.axis('off')
+plt.show()
+
+plt.figure(figsize=(12,12))
+model_df.plot(
+    markersize=model_df['entries_mean'] / model_df['entries_mean'].max() * 200,
+    color='blue',
+    alpha=0.6,
+    edgecolor='k'
+)
+plt.title("MBTA Stops by Average Daily Entries")
+plt.axis('off')
+plt.show()
+
+corr_cols = ['entries_mean', 'POP20', 'HOUSING20', 'MEDIAN_INCOME']
+corr_matrix = model_df[corr_cols].corr()
+
+plt.figure(figsize=(8,6))
+sns.heatmap(corr_matrix, annot=True, cmap='viridis')
+plt.title("Correlation Matrix")
+plt.show()
