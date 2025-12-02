@@ -1,0 +1,156 @@
+import pandas as pd
+import geopandas as gpd
+from shapely import wkt, Point
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+import numpy as np
+
+# -------------------------------
+# 1) Load MBTA stops
+# -------------------------------
+stops = pd.read_csv("stops.txt")
+
+# Convert stops to GeoDataFrame
+stops['geometry'] = stops.apply(lambda row: Point(row['stop_lon'], row['stop_lat']), axis=1)
+stops_gdf = gpd.GeoDataFrame(stops, geometry='geometry', crs="EPSG:4326")
+
+# -------------------------------
+# 2) Load and aggregate MBTA gated entries
+# -------------------------------
+def load_ridership(path):
+    df = pd.read_csv(path)
+    drop_indices = [1222104, 1222105, 1222106]
+    df = df.drop(drop_indices, errors='ignore')
+
+    # Daily aggregation
+    daily_agg = df.groupby(['stop_id','service_date'], as_index=False)['gated_entries'].sum()
+
+    # Aggregate per stop
+    stop_agg = daily_agg.groupby('stop_id')['gated_entries'].agg(
+        entries_mean='mean',
+        entries_total='sum',
+        n_observations='count'
+    ).reset_index()
+    return stop_agg
+
+agg = load_ridership("MBTA_Gated_Station_Entries.csv")
+
+# Merge stops with ridership
+stops_gdf['stop_id'] = stops_gdf['stop_id'].astype(str)
+agg['stop_id'] = agg['stop_id'].astype(str)
+stops_gdf = stops_gdf.merge(agg, on='stop_id', how='left')
+
+# -------------------------------
+# 3) Load Census tracts and spatial join
+# -------------------------------
+tracts = gpd.read_file("CENSUS2020TRACTS_POLY.shp").to_crs("EPSG:4326")
+stops_gdf = gpd.sjoin(
+    stops_gdf,
+    tracts[['GEOID20','POP20','HOUSING20','geometry']],
+    how='left',
+    predicate='within'
+)
+
+# -------------------------------
+# 4) EDA
+# -------------------------------
+print("Basic stats for ridership columns:")
+print(stops_gdf[['entries_mean','entries_total','n_observations']].describe())
+print("\nMissing values per column:")
+print(stops_gdf[['entries_mean','entries_total','n_observations']].isna().sum())
+
+top10 = stops_gdf.nlargest(10, 'entries_total')
+bottom10 = stops_gdf.nsmallest(10, 'entries_total')
+
+# Bar plots for top/bottom
+sns.set(style="whitegrid")
+plt.figure(figsize=(10,6))
+sns.barplot(data=top10, x='entries_total', y='stop_name', palette='viridis')
+plt.title("Top 10 MBTA Stops by Total Entries")
+plt.show()
+
+plt.figure(figsize=(10,6))
+sns.barplot(data=bottom10, x='entries_total', y='stop_name', palette='magma')
+plt.title("Bottom 10 MBTA Stops by Total Entries")
+plt.show()
+
+# Map visualization
+plt.figure(figsize=(12,12))
+stops_gdf.plot(
+    markersize=stops_gdf['entries_mean'].fillna(0)/stops_gdf['entries_mean'].max()*150,
+    color='blue', alpha=0.6
+)
+plt.title("MBTA Stops Map (size = avg daily entries)")
+plt.show()
+
+# -------------------------------
+# 5) Regression modeling
+# -------------------------------
+model_df = stops_gdf.dropna(subset=['entries_mean','POP20','HOUSING20']).copy()
+model_df['log_entries'] = np.log1p(model_df['entries_mean'])
+X = model_df[['POP20','HOUSING20']]
+y = model_df['log_entries']
+
+X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.25, random_state=42)
+reg = LinearRegression()
+reg.fit(X_train, y_train)
+y_pred = reg.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+print(f"Regression results: MSE={mse:.2f}, R2={r2:.2f}")
+
+# Regression plot
+plt.figure(figsize=(8,6))
+plt.scatter(y_test, y_pred, alpha=0.7)
+plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+plt.xlabel('Actual log(entries_mean)')
+plt.ylabel('Predicted log(entries_mean)')
+plt.title('Linear Regression Fit')
+plt.show()
+
+# Feature importance
+coef_df = pd.DataFrame({'feature':X.columns,'coefficient':reg.coef_})
+sns.barplot(data=coef_df, x='coefficient', y='feature', palette='viridis')
+plt.title('Feature Coefficients')
+plt.show()
+
+# -------------------------------
+# 6) Clustering of stops
+# -------------------------------
+cluster_df = model_df[['entries_mean','POP20','HOUSING20']].copy()
+cluster_df = cluster_df.fillna(0)
+scaler = StandardScaler()
+cluster_scaled = scaler.fit_transform(cluster_df)
+
+kmeans = KMeans(n_clusters=3, random_state=42)
+model_df['cluster'] = kmeans.fit_predict(cluster_scaled)
+
+# Cluster visualization
+plt.figure(figsize=(10,6))
+sns.scatterplot(
+    data=model_df,
+    x='POP20', y='entries_mean',
+    hue='cluster', palette='Set2', s=100
+)
+plt.title('Clustering of MBTA Stops by Ridership and Population')
+plt.xlabel('Population in Census Tract')
+plt.ylabel('Average Daily Entries')
+plt.show()
+
+# Map clusters
+plt.figure(figsize=(12,12))
+model_df.plot(
+    column='cluster',
+    categorical=True,
+    legend=True,
+    markersize=50,
+    cmap='Set2'
+)
+plt.title("MBTA Stops Clustered by Ridership and Demographics")
+plt.show()
